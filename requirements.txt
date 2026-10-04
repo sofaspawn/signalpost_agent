@@ -1,0 +1,2 @@
+# Signalpost Agent Dependencies
+# Python 3.8+ standard library only - no external dependencies required
