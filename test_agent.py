@@ -8,7 +8,7 @@ import subprocess
 import json
 import random
 import sys
-
+import urllib.request
 
 def run_agent(org_nr: str) -> dict:
     """Run the agent and return parsed result."""
@@ -23,18 +23,16 @@ def run_agent(org_nr: str) -> dict:
     except json.JSONDecodeError:
         return {"error": "Failed to parse output", "stdout": result.stdout, "stderr": result.stderr}
 
-
 def test_valid_company():
     """Test with a known valid company (Equinor)."""
-    print("Testing Equinor (926340829)...")
-    result = run_agent("926340829")
+    print("Testing Equinor (923609016)...")
+    result = run_agent("923609016")
 
     assert result.get("success"), f"Expected success, got: {result}"
-    assert result.get("company_name") == "Equinor ASA", f"Wrong company name: {result.get('company_name')}"
+    assert result.get("company_name", "").upper() == "EQUINOR ASA", f"Wrong company name: {result.get('company_name')}"
     assert result.get("fact_count", 0) >= 5, f"Too few facts: {result.get('fact_count')}"
 
     print(f"  ✓ Found {result['fact_count']} facts for {result['company_name']}")
-
 
 def test_invalid_company():
     """Test with invalid org number."""
@@ -44,7 +42,6 @@ def test_invalid_company():
     assert "error" in result, f"Expected error for invalid input, got: {result}"
     print(f"  ✓ Correctly rejected invalid input: {result['error']}")
 
-
 def test_not_found():
     """Test with valid format but non-existent company."""
     print("Testing non-existent company...")
@@ -53,16 +50,21 @@ def test_not_found():
     assert "error" in result, f"Expected error for non-existent company, got: {result}"
     print(f"  ✓ Correctly handled not found: {result['error']}")
 
-
 def test_random_companies(count: int = 10):
-    """Test with random companies from database."""
+    """Test with random companies from live BRREG."""
     print(f"Testing {count} random companies...")
 
-    # Load database to get valid org numbers
-    with open("company_database.json") as f:
-        db = json.load(f)
+    # Fetch 50 random real companies from BRREG
+    req = urllib.request.Request("https://data.brreg.no/enhetsregisteret/api/enheter?size=50")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            enheter = data.get("_embedded", {}).get("enheter", [])
+            org_numbers = [e["organisasjonsnummer"] for e in enheter]
+    except Exception as e:
+        print(f"  ✗ Failed to fetch random companies: {e}")
+        return
 
-    org_numbers = list(db.keys())
     samples = random.sample(org_numbers, min(count, len(org_numbers)))
 
     success_count = 0
@@ -75,8 +77,10 @@ def test_random_companies(count: int = 10):
             total_facts += result.get("fact_count", 0)
 
     print(f"  ✓ {success_count}/{count} successful lookups")
-    print(f"  ✓ Average {total_facts / success_count:.1f} facts per company" if success_count > 0 else "  ✗ No successful lookups")
-
+    if success_count > 0:
+        print(f"  ✓ Average {total_facts / success_count:.1f} facts per company")
+    else:
+        print("  ✗ No successful lookups")
 
 def main():
     print("=" * 50)
@@ -103,7 +107,6 @@ def main():
     except Exception as e:
         print(f"\n✗ Unexpected error: {e}")
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
