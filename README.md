@@ -1,43 +1,50 @@
 # Signalpost Agent — Norwegian company facts with evidence
 
-Look up a Norwegian organization number against Brønnøysundregistrene (BRREG) and return verified facts with the exact public API record used, source dates where available, source availability, and explicit limitations.
+Signalpost looks up a Norwegian organization number in Brønnøysundregistrene (BRREG) and returns current official company facts with source links and dates. It aims to make every claim auditable and avoids publishing inferred, stale-cache, or synthetic facts.
 
-## Run
+The repository also includes `data/brreg_profiles.json`, a dated snapshot of 1,000 real company records fetched from BRREG. The interactive lookup is live and independent of that snapshot; it never silently uses the snapshot as a fallback when BRREG is unavailable.
+
+## Quick start
+
+Python 3.8+, no dependencies:
 
 ```bash
 python3 agent.py 923609016
 ```
 
-Python 3.8+; no third-party dependencies. Successful lookups make up to three BRREG requests (company, roles, accounts). The company identity must match the requested number or the profile is withheld. Missing data is omitted; source errors are distinguished from a genuine 404. This tool does not use an LLM and does not infer facts from synthetic data.
+Returns JSON. A successful lookup makes up to three BRREG requests. Invalid numbers are rejected before network access. See [`QUICKSTART.md`](QUICKSTART.md) for setup, dataset refresh, output details, safeguards, tests, costs, and submission notes.
 
-Output is JSON. Each fact includes `source`, `source_url`, and `date` (null if BRREG does not provide a defensible fact date). `source_status` describes partial source failures. `data_freshness` distinguishes query date, company record date, and latest accounts period end.
+## Dataset
+
+Refresh the committed 1,000-profile snapshot from the repository root:
+
+```bash
+python3 sync_dataset.py
+```
+
+The importer verifies each organization number and company name, excludes bulk email/mobile fields, and atomically writes the output only after it has collected the requested minimum. Default output is `data/brreg_profiles.json`; default count is 1,000. Refresh as needed before submission to keep the snapshot current. It is a snapshot, not a live mirror.
 
 ## Tests
 
 ```bash
-python3 -m unittest -v test_agent.py
+python3 -m unittest -v
 ```
 
-Tests are offline and mock BRREG responses. A live smoke test, if desired, is `python3 agent.py 923609016`; it requires network access and sends requests to the public BRREG APIs.
+Tests are offline and mock BRREG responses. For full usage and data limitations, read [`QUICKSTART.md`](QUICKSTART.md).
 
-## Sources and safeguards
+## Safeguards
 
-- BRREG Enhetsregisteret: `https://data.brreg.no/enhetsregisteret/api/enheter/{org_number}`
-- BRREG roles: `https://data.brreg.no/enhetsregisteret/api/enheter/{org_number}/roller`
-- BRREG filed accounts: `https://data.brreg.no/regnskapsregisteret/regnskap/{org_number}`
-- Organization numbers are checked for length, allowed leading digit, and Mod-11 check digit before any request.
-- A mismatched company number, empty primary record, invalid financial amount, or upstream outage cannot silently become a published fact.
-- BRREG does not expose a per-field modification date for every field. In that case the fact date is null; query time is never substituted as a fact update date.
-- Financial amounts are included only when present in the filed-accounts response, with the accounts period end attached.
+- Mod-11 validation before lookup.
+- Returned BRREG organization number must match the requested number.
+- Per-fact source endpoint; unknown update dates remain unknown.
+- Source outage, 404, sparse source record, and identity mismatch are distinct.
+- Financial values are only emitted from the official accounts response for that organization number.
+- No LLM, synthetic profiles, or fabricated financial data.
 
-## Coverage and profile count
-
-This is a live lookup agent, not a preloaded set of 1,000 profiles. It can look up companies present in BRREG, including companies not known in advance. The former `company_database.json` contained synthetic values and is intentionally excluded from the agent and submission; it was removed to prevent invented data from being mistaken for real company facts. There is no persistent cache, and no claim is made that a static 1,000-profile dataset is bundled.
-
-## Hackathon details
+## Hackathon run details
 
 - One command: `python3 agent.py <company_number>`
-- Model: none; deterministic Python standard library implementation.
-- External API: public BRREG endpoints; no API key.
-- Declared API cost: $0 per lookup (network/provider charges, if any, are outside the software; up to three requests per company).
-- No profile data is persisted locally.
+- Model: none; Python standard library only.
+- API: public BRREG endpoints; no API key.
+- Declared external model/API cost: $0 per lookup.
+- Up to three outbound requests per successful lookup; the included snapshot is separate from live lookups.
