@@ -1,232 +1,172 @@
 #!/usr/bin/env python3
-"""
-Signalpost Agent - Norwegian Company Information Finder
+"""Evidence-first Norwegian company lookup using the public BRREG APIs."""
 
-Agent that takes a Norwegian company number (organisasjonsnummer) and returns
-company facts from public sources with source links and dates.
-"""
-
-import sys
 import json
-import urllib.request
+import sys
 import urllib.error
+import urllib.request
 from datetime import date
 
+BASE_ENTITY_URL = "https://data.brreg.no/enhetsregisteret/api/enheter"
+ACCOUNTS_URL = "https://data.brreg.no/regnskapsregisteret/regnskap"
+SOURCE_NAME = "Brønnøysundregistrene (BRREG)"
+USER_AGENT = "Signalpost-Hackathon-Agent/1.0 (public company lookup)"
+TIMEOUT_SECONDS = 12
+
+
+def valid_org_number(value):
+    """Validate Norwegian organization number syntax and its Mod-11 check digit."""
+    number = str(value).strip().replace(" ", "")
+    if len(number) != 9 or number[0] not in "89" or not number.isascii() or not number.isdigit():
+        return False
+    weighted_sum = sum(int(digit) * weight for digit, weight in zip(number[:8], (3, 2, 7, 6, 5, 4, 3, 2)))
+    remainder = weighted_sum % 11
+    check_digit = 11 - remainder
+    if check_digit == 11:
+        check_digit = 0
+    return check_digit != 10 and check_digit == int(number[8])
+
+
 def get_json(url):
-    req = urllib.request.Request(
-        url, 
-        headers={'User-Agent': 'Signalpost Agent / Builderr Hackathon'}
-    )
+    """Return (JSON, None) or (None, actionable error); never mask transport errors."""
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            return json.loads(response.read().decode('utf-8'))
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return None
-        return None
-    except Exception as e:
-        return None
+        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+            return json.loads(response.read().decode("utf-8")), None
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None, "not_found"
+        return None, "upstream_http_" + str(exc.code)
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None, "upstream_unavailable"
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, "invalid_upstream_response"
 
-def extract_facts(company_data, roles_data, regnskap_data):
+
+def _fact(title, value, url, observed_date=None, context=None):
+    fact = {
+        "title": title,
+        "value": value,
+        "source": SOURCE_NAME,
+        "source_url": url,
+        "date": observed_date or None,
+    }
+    if context:
+        fact["context"] = context
+    return fact
+
+
+def _money(value):
+    try:
+        amount = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not __import__("math").isfinite(amount):
+        return None
+    return f"{amount:,.0f} NOK"
+
+
+def extract_facts(company_data, roles_data, regnskap_data, org_nr):
+    """Extract only values present in source payloads; attach the endpoint per fact."""
     facts = []
+    entity_url = BASE_ENTITY_URL + "/" + org_nr
+    roles_url = entity_url + "/roller"
+    accounts_url = ACCOUNTS_URL + "/" + org_nr
+    registration_date = company_data.get("registreringsdatoEnhetsregisteret")
 
-    # Name
-    if company_data.get("navn"):
-        facts.append({
-            "title": "Company Name",
-            "value": company_data["navn"],
-            "source": "Brønnøysundregistrene (BRREG)",
-            "source_url": "https://brreg.no",
-            "date": company_data.get("registreringsdatoEnhetsregisteret", "")
-        })
+    def add(title, value, field_date=None, context=None):
+        if value is not None and value != "":
+            facts.append(_fact(title, value, entity_url, field_date, context))
 
-    # Organization number
-    if company_data.get("organisasjonsnummer"):
-        facts.append({
-            "title": "Organization Number",
-            "value": company_data["organisasjonsnummer"],
-            "source": "Brønnøysundregistrene",
-            "source_url": "https://brreg.no",
-            "date": company_data.get("registreringsdatoEnhetsregisteret", "")
-        })
+    add("Company name", company_data.get("navn"))
+    add("Organization number", company_data.get("organisasjonsnummer"))
+    add("Register entry date", registration_date, registration_date, "Initial registration date; not a claim that current facts were updated on this date.")
+    form = company_data.get("organisasjonsform") or {}
+    add("Legal form", form.get("beskrivelse"))
 
-    # Legal form
-    org_form = company_data.get("organisasjonsform", {}).get("beskrivelse")
-    if org_form:
-        facts.append({
-            "title": "Legal Form",
-            "value": org_form,
-            "source": "Brønnøysundregistrene",
-            "source_url": "https://brreg.no",
-            "date": company_data.get("registreringsdatoEnhetsregisteret", "")
-        })
+    address = company_data.get("forretningsadresse") or {}
+    address_parts = address.get("adresse") or []
+    address_value = ", ".join(part for part in [
+        ", ".join(str(part) for part in address_parts if part),
+        " ".join(str(part) for part in [address.get("postnummer"), address.get("poststed")] if part),
+    ] if part)
+    add("Business address", address_value)
 
-    # Business address
-    addr_obj = company_data.get("forretningsadresse", {})
-    adresse = addr_obj.get("adresse", [""])[0] if addr_obj.get("adresse") else ""
-    postnummer = addr_obj.get("postnummer", "")
-    poststed = addr_obj.get("poststed", "")
-    full_address = f"{adresse}, {postnummer} {poststed}".strip(" ,")
-    if full_address:
-        facts.append({
-            "title": "Business Address",
-            "value": full_address,
-            "source": "Brønnøysundregistrene",
-            "source_url": "https://brreg.no",
-            "date": ""
-        })
+    industry = company_data.get("naeringskode1") or {}
+    industry_value = " - ".join(str(part) for part in [industry.get("kode"), industry.get("beskrivelse")] if part)
+    add("Industry", industry_value)
 
-    # Industry/NACE code
-    nace = company_data.get("naeringskode1", {})
-    if nace.get("kode") and nace.get("beskrivelse"):
-        facts.append({
-            "title": "Industry",
-            "value": f"{nace.get('kode')} - {nace.get('beskrivelse')}",
-            "source": "Brønnøysundregistrene",
-            "source_url": "https://brreg.no",
-            "date": ""
-        })
-
-    # Status
-    status = "Aktiv"
+    status = None
     if company_data.get("konkurs"):
         status = "Konkurs"
     elif company_data.get("underAvvikling"):
         status = "Under avvikling"
-        
-    facts.append({
-        "title": "Status",
-        "value": status,
-        "source": "Brønnøysundregistrene",
-        "source_url": "https://brreg.no",
-        "date": ""
-    })
+    elif company_data.get("underTvangsavviklingEllerTvangsopplosning"):
+        status = "Under tvangsavvikling eller tvangsoppløsning"
+    elif company_data.get("slettedato"):
+        status = "Slettet"
+    elif company_data.get("organisasjonsnummer"):
+        status = "Registered (no adverse status flag in returned record)"
+    add("Register status", status)
 
-    # Employees
     if company_data.get("antallAnsatte") is not None:
-        facts.append({
-            "title": "Employees",
-            "value": str(company_data.get("antallAnsatte")),
-            "source": "Brønnøysundregistrene",
-            "source_url": "https://brreg.no",
-            "date": ""
-        })
+        add("Employees", company_data["antallAnsatte"], context="Employee count as reported in the register; not necessarily real-time.")
+    add("Website", company_data.get("hjemmeside"))
 
-    # Website
-    if company_data.get("hjemmeside"):
-        facts.append({
-            "title": "Website",
-            "value": company_data["hjemmeside"],
-            "source": "Brønnøysundregistrene",
-            "source_url": "https://brreg.no",
-            "date": ""
-        })
+    if roles_data and isinstance(roles_data, dict):
+        for group in roles_data.get("rollegrupper", []):
+            for role in group.get("roller", []):
+                role_type = (role.get("type") or {}).get("beskrivelse")
+                person = (role.get("person") or {}).get("navn") or {}
+                name = " ".join(str(person.get(key, "")) for key in ("fornavn", "mellomnavn", "etternavn") if person.get(key)).strip()
+                if name and role_type in ("Daglig leder", "Styrets leder"):
+                    facts.append(_fact("Leader - " + role_type, name, roles_url, context="Role and person reported in BRREG roles record."))
 
-    # Leaders
-    if roles_data and "rollegrupper" in roles_data:
-        for gruppe in roles_data["rollegrupper"]:
-            for rolle in gruppe.get("roller", []):
-                rolle_type = rolle.get("type", {}).get("beskrivelse")
-                person = rolle.get("person", {}).get("navn", {})
-                if person and rolle_type in ["Daglig leder", "Styrets leder"]:
-                    navn = f"{person.get('fornavn', '')} {person.get('etternavn', '')}".strip()
-                    facts.append({
-                        "title": f"Leader - {rolle_type}",
-                        "value": navn,
-                        "source": "Brønnøysundregistrene",
-                        "source_url": "https://brreg.no",
-                        "date": ""
-                    })
-
-    # Financial data
-    latest_accounts_date = ""
-    if regnskap_data and isinstance(regnskap_data, list) and len(regnskap_data) > 0:
-        try:
-            # Sort by tilDato descending
-            sorted_data = sorted(regnskap_data, key=lambda x: x.get("regnskapsperiode", {}).get("tilDato", ""), reverse=True)
-            latest_reg = sorted_data[0]
-            
-            til_dato = latest_reg.get("regnskapsperiode", {}).get("tilDato", "")
-            latest_accounts_date = til_dato
-            aar = til_dato[:4] if til_dato else ""
-            
-            if aar:
-                facts.append({
-                    "title": "Last Accounts Year",
-                    "value": aar,
-                    "source": "Brønnøysundregistrene",
-                    "source_url": "https://brreg.no",
-                    "date": til_dato
-                })
-            
-            res = latest_reg.get("resultatregnskapResultat", {}).get("aarsresultat")
-            if res is not None:
-                val = float(res)
-                if abs(val) >= 1e9:
-                    val_str = f"{val / 1e9:.1f} billion NOK"
-                elif abs(val) >= 1e6:
-                    val_str = f"{val / 1e6:.1f} million NOK"
-                else:
-                    val_str = f"{val:.0f} NOK"
-                
-                facts.append({
-                    "title": "Annual Result (Last Accounts)",
-                    "value": val_str,
-                    "source": "Brønnøysundregistrene - Filed Accounts",
-                    "source_url": "https://brreg.no",
-                    "date": til_dato
-                })
-                
-            bal = latest_reg.get("egenkapitalGjeld", {}).get("sumEgenkapitalGjeld")
-            if bal is not None:
-                val = float(bal)
-                if abs(val) >= 1e9:
-                    val_str = f"{val / 1e9:.1f} billion NOK"
-                elif abs(val) >= 1e6:
-                    val_str = f"{val / 1e6:.1f} million NOK"
-                else:
-                    val_str = f"{val:.0f} NOK"
-                    
-                facts.append({
-                    "title": "Balance Sheet Total",
-                    "value": val_str,
-                    "source": "Brønnøysundregistrene - Filed Accounts",
-                    "source_url": "https://brreg.no",
-                    "date": til_dato
-                })
-        except Exception:
-            pass
-
+    latest_accounts_date = None
+    if isinstance(regnskap_data, list):
+        valid_records = [record for record in regnskap_data if isinstance(record, dict)]
+        valid_records.sort(key=lambda record: ((record.get("regnskapsperiode") or {}).get("tilDato") or ""), reverse=True)
+        if valid_records:
+            latest = valid_records[0]
+            period = latest.get("regnskapsperiode") or {}
+            end_date = period.get("tilDato")
+            latest_accounts_date = end_date
+            if end_date:
+                facts.append(_fact("Latest accounts period end", end_date, accounts_url, end_date))
+            result = (latest.get("resultatregnskapResultat") or {}).get("aarsresultat")
+            formatted = _money(result)
+            if formatted is not None:
+                facts.append(_fact("Annual result", formatted, accounts_url, end_date, "Filed annual accounts; period end is shown as the reporting date."))
+            balance = (latest.get("egenkapitalGjeld") or {}).get("sumEgenkapitalGjeld")
+            formatted = _money(balance)
+            if formatted is not None:
+                facts.append(_fact("Balance sheet total", formatted, accounts_url, end_date, "Filed annual accounts; period end is shown as the reporting date."))
     return facts, latest_accounts_date
 
-def lookup_company(org_nr: str) -> dict:
-    org_nr = org_nr.strip().replace(" ", "")
 
-    if not org_nr.isdigit() or len(org_nr) != 9:
-        return {
-            "error": "Invalid Norwegian company number",
-            "details": "Organization number must be 9 digits",
-            "received": org_nr
-        }
+def lookup_company(org_nr):
+    org_nr = str(org_nr).strip().replace(" ", "")
+    if not valid_org_number(org_nr):
+        return {"success": False, "error": "invalid_org_number", "details": "Enter a valid 9-digit Norwegian organization number, including a valid Mod-11 check digit.", "received": org_nr}
 
-    # Fetch live data
-    base_url = f"https://data.brreg.no/enhetsregisteret/api/enheter/{org_nr}"
-    company_data = get_json(base_url)
-    
-    if not company_data:
-        return {
-            "error": "Company not found",
-            "org_number": org_nr,
-            "details": "Company not found in public registers"
-        }
+    company_url = BASE_ENTITY_URL + "/" + org_nr
+    company_data, company_error = get_json(company_url)
+    if company_data is None:
+        if company_error == "not_found":
+            return {"success": False, "error": "company_not_found", "org_number": org_nr, "details": "No company record was found at BRREG.", "source_url": company_url}
+        return {"success": False, "error": "source_unavailable", "org_number": org_nr, "details": "Could not verify the company against BRREG; no profile has been published.", "source_error": company_error, "source_url": company_url}
 
-    roles_data = get_json(f"{base_url}/roller")
-    regnskap_data = get_json(f"https://data.brreg.no/regnskapsregisteret/regnskap/{org_nr}")
+    # Identity binding is mandatory: never use any payload that differs from the requested number.
+    if str(company_data.get("organisasjonsnummer", "")) != org_nr:
+        return {"success": False, "error": "identity_mismatch", "org_number": org_nr, "details": "BRREG response organization number did not match the requested number; profile withheld.", "source_url": company_url}
 
-    facts, latest_accounts_date = extract_facts(company_data, roles_data, regnskap_data)
-
-    if not latest_accounts_date:
-        latest_accounts_date = company_data.get("sisteInnsendteAarsregnskap")
+    roles_url = company_url + "/roller"
+    accounts_url = ACCOUNTS_URL + "/" + org_nr
+    roles_data, roles_error = get_json(roles_url)
+    accounts_data, accounts_error = get_json(accounts_url)
+    facts, latest_accounts_date = extract_facts(company_data, roles_data, accounts_data, org_nr)
+    if not facts:
+        return {"success": False, "error": "empty_source_record", "org_number": org_nr, "details": "BRREG returned no publishable facts; profile withheld.", "source_url": company_url}
 
     return {
         "success": True,
@@ -236,20 +176,22 @@ def lookup_company(org_nr: str) -> dict:
         "facts": facts,
         "fact_count": len(facts),
         "data_freshness": {
-            "last_updated": latest_accounts_date or date.today().isoformat(),
-            "from_source": "Brønnøysundregistrene (Norwegian Business Register)"
-        }
+            "last_accounts_period_end": latest_accounts_date,
+            "accounts_status": "available" if accounts_error is None and isinstance(accounts_data, list) else accounts_error or "no_accounts_returned",
+            "company_record_date": company_data.get("oppdateringsdato"),
+            "queried_at": date.today().isoformat(),
+        },
+        "source_status": {"company": "available", "roles": "available" if roles_error is None and roles_data is not None else roles_error or "no_roles_returned", "accounts": "available" if accounts_error is None and accounts_data is not None else accounts_error or "no_accounts_returned"},
+        "limitations": ["BRREG is the authoritative source used. Fields absent from its response are omitted rather than inferred.", "A source query date does not imply that the underlying company facts changed on that date."],
     }
 
-def main():
-    if len(sys.argv) < 2:
-        print("Signalpost Agent - Norwegian Company Information Finder")
-        print("Usage: agent.py <company_number>")
-        sys.exit(1)
 
-    org_nr = sys.argv[1]
-    result = lookup_company(org_nr)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: python3 agent.py <Norwegian organization number>", file=sys.stderr)
+        sys.exit(2)
+    print(json.dumps(lookup_company(sys.argv[1]), indent=2, ensure_ascii=False))
+
 
 if __name__ == "__main__":
     main()

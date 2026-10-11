@@ -1,66 +1,43 @@
-# Signalpost Agent - Norwegian Company Information Finder
+# Signalpost Agent — Norwegian company facts with evidence
 
-An agent that takes a Norwegian company number (organisasjonsnummer) and returns
-company facts from public sources with source links and dates.
+Look up a Norwegian organization number against Brønnøysundregistrene (BRREG) and return verified facts with the exact public API record used, source dates where available, source availability, and explicit limitations.
 
-## Usage
+## Run
 
 ```bash
-python3 agent.py <company_number>
+python3 agent.py 923609016
 ```
 
-Example:
+Python 3.8+; no third-party dependencies. Successful lookups make up to three BRREG requests (company, roles, accounts). The company identity must match the requested number or the profile is withheld. Missing data is omitted; source errors are distinguished from a genuine 404. This tool does not use an LLM and does not infer facts from synthetic data.
+
+Output is JSON. Each fact includes `source`, `source_url`, and `date` (null if BRREG does not provide a defensible fact date). `source_status` describes partial source failures. `data_freshness` distinguishes query date, company record date, and latest accounts period end.
+
+## Tests
+
 ```bash
-python3 agent.py 926340829
+python3 -m unittest -v test_agent.py
 ```
 
-Output is JSON with:
-- Company facts with titles
-- Source links and dates
-- Evidence for each fact
+Tests are offline and mock BRREG responses. A live smoke test, if desired, is `python3 agent.py 923609016`; it requires network access and sends requests to the public BRREG APIs.
 
-## Requirements
+## Sources and safeguards
 
-- Python 3.8+
+- BRREG Enhetsregisteret: `https://data.brreg.no/enhetsregisteret/api/enheter/{org_number}`
+- BRREG roles: `https://data.brreg.no/enhetsregisteret/api/enheter/{org_number}/roller`
+- BRREG filed accounts: `https://data.brreg.no/regnskapsregisteret/regnskap/{org_number}`
+- Organization numbers are checked for length, allowed leading digit, and Mod-11 check digit before any request.
+- A mismatched company number, empty primary record, invalid financial amount, or upstream outage cannot silently become a published fact.
+- BRREG does not expose a per-field modification date for every field. In that case the fact date is null; query time is never substituted as a fact update date.
+- Financial amounts are included only when present in the filed-accounts response, with the accounts period end attached.
 
-## Scoring (100 points)
+## Coverage and profile count
 
-This agent is designed for the Signalpost daily test harness with scoring:
+This is a live lookup agent, not a preloaded set of 1,000 profiles. It can look up companies present in BRREG, including companies not known in advance. The former `company_database.json` contained synthetic values and is intentionally excluded from the agent and submission; it was removed to prevent invented data from being mistaken for real company facts. There is no persistent cache, and no claim is made that a static 1,000-profile dataset is bundled.
 
-- **Useful information (35 points)**: Comprehensive company facts
-- **Match with evidence (30 points)**: Each fact backed by source URL and date
-- **Update correctly (20 points)**: Freshness indicators from latest filed accounts
-- **Useful explanations (10 points)**: Clear fact titles and context
-- **Easy to use (5 points)**: Single command-line interface
+## Hackathon details
 
-## Daily Limits
-
-- 45 minutes processing time
-- 2,000 outbound requests
-- $10 in declared external API costs
-
-## Data Sources
-
-- Brønnøysundregistrene (BRREG) - Norwegian Business Register
-- Proff.no - Business directory
-- W2.no - Company information
-
-## Structure
-
-```
-.
-├── agent.py           # Main agent script
-├── database.py        # Company database generator (optional)
-├── README.md          # This file
-└── requirements.txt   # Python dependencies
-```
-
-## Testing with Builderr
-
-The agent will be tested on 100 random companies daily. The database is pre-loaded
-with known Norwegian companies (Equinor, Telenor, Sparebanken 1, etc.).
-
-To qualify for prizes:
-- At least 65/100 overall score
-- 21/35 coverage
-- All published accuracy requirements met
+- One command: `python3 agent.py <company_number>`
+- Model: none; deterministic Python standard library implementation.
+- External API: public BRREG endpoints; no API key.
+- Declared API cost: $0 per lookup (network/provider charges, if any, are outside the software; up to three requests per company).
+- No profile data is persisted locally.
